@@ -4,7 +4,7 @@ import uuid
 import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-
+from .llm import run_llm
 from .preprocess import extract_relevant_lines, summarize_metadata
 from .storage import store_log_bytes, get_log_bytes, ensure_bucket
 from .embeddings import index_chunks, retrieve_top_k
@@ -61,79 +61,121 @@ async def ci_webhook(request: Request):
     return JSONResponse(resp)
 
 
+from .llm import run_llm
+
 @app.post("/analyze")
 async def analyze(request: Request):
     """
-    Analyze endpoint (POC wiring):
-    - accepts JSON with either {"log_text": "..."} or {"log_key": "<minio-key>"}
-    - runs preprocessing (extract_relevant_lines)
-    - indexes reduced text into Qdrant (collection named with incident id)
-    - retrieves top-k chunks for a simple query
-    - returns preprocessed snippet, metadata, indexed count, retrieved chunks
-
-    Note: This POC recreates the collection per call for simplicity (dev only).
+    Analyze endpoint:
+    - preprocess logs
+    - embed + index into Qdrant
+    - retrieve top-k chunks
+    - call remote LLM for explanation + fixes
     """
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="invalid json payload")
 
-    # Accept either raw text or key
     raw_text = None
     stored_key = None
     incident_id = payload.get("incident_id") or str(uuid.uuid4())
     collection_name = f"{DEFAULT_COLLECTION_PREFIX}_{incident_id}"
 
+    # -----------------------------
+    # INPUT HANDLING
+    # -----------------------------
     if "log_text" in payload and payload["log_text"]:
         raw_text = payload["log_text"]
-        # Optionally store raw log in MinIO if user asked
+
         if payload.get("store", False):
             try:
                 key = f"{incident_id}.log"
-                store_log_bytes(raw_text.encode("utf-8", errors="replace"), key, bucket=LOGS_BUCKET)
+                store_log_bytes(
+                    raw_text.encode("utf-8", errors="replace"),
+                    key,
+                    bucket=LOGS_BUCKET
+                )
                 stored_key = key
-            except Exception as e:
-                logging.exception("failed to store log_text to minio")
-                # continue — storage failure shouldn't block local analysis
+            except Exception:
+                logging.exception("failed to store log_text")
+
     elif "log_key" in payload and payload["log_key"]:
-        # fetch from MinIO
         try:
             raw_bytes = get_log_bytes(payload["log_key"], bucket=LOGS_BUCKET)
             raw_text = raw_bytes.decode("utf-8", errors="replace")
             stored_key = payload["log_key"]
         except Exception as e:
-            logging.exception("failed to fetch log_key from minio")
-            raise HTTPException(status_code=500, detail=f"failed to retrieve log_key: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
     else:
-        raise HTTPException(status_code=400, detail="provide log_text or log_key in JSON body")
+        raise HTTPException(status_code=400, detail="provide log_text or log_key")
 
-    # 1) Preprocess
+    # -----------------------------
+    # PREPROCESSING
+    # -----------------------------
     reduced = extract_relevant_lines(raw_text)
     metadata = summarize_metadata(raw_text)
 
-    # 2) Index reduced text into Qdrant (collection per incident for POC)
+    # -----------------------------
+    # EMBEDDINGS + INDEXING
+    # -----------------------------
     try:
         index_result = index_chunks(reduced, collection=collection_name)
         indexed_count = index_result.get("count", 0)
+        index_error = None
     except Exception as e:
         logging.exception("indexing failed")
-        # continue but report failure
         indexed_count = 0
         index_error = str(e)
-    else:
-        index_error = None
 
-    # 3) Retrieve top-k chunks for a simple query (RAG proof)
+    # -----------------------------
+    # RETRIEVAL (RAG)
+    # -----------------------------
     try:
-        retrieved = retrieve_top_k("Summarize the failure and suggest fixes", collection=collection_name, k=5)
+        retrieved = retrieve_top_k(
+            "Summarize the failure and suggest fixes",
+            collection=collection_name,
+            k=5
+        )
+        retrieval_error = None
     except Exception as e:
         logging.exception("retrieval failed")
         retrieved = []
         retrieval_error = str(e)
-    else:
-        retrieval_error = None
 
-    # 4) Build response
+    # -----------------------------
+    # LLM ANALYSIS (REMOTE)
+    # -----------------------------
+    llm_analysis = None
+
+    if retrieved:
+        context_blocks = []
+        for idx, item in enumerate(retrieved, start=1):
+            if item.get("chunk"):
+                context_blocks.append(
+                    f"[CHUNK {idx}]\n{item['chunk']}"
+                )
+
+        llm_prompt = f"""
+You are an expert CI/CD debugging assistant.
+
+Below are extracted log snippets from a failed CI/CD pipeline.
+
+LOG CONTEXT:
+{chr(10).join(context_blocks)}
+
+TASK:
+1. Explain the root cause clearly.
+2. List 2–3 likely causes.
+3. Suggest concrete fixes (commands, config, or code).
+4. Mention assumptions if any.
+"""
+
+        llm_analysis = run_llm(llm_prompt)
+
+    # -----------------------------
+    # FINAL RESPONSE
+    # -----------------------------
     resp = {
         "incident_id": incident_id,
         "stored_key": stored_key,
@@ -145,7 +187,7 @@ async def analyze(request: Request):
         "index_error": index_error,
         "retrieved_top_k": retrieved,
         "retrieval_error": retrieval_error,
-        "note": "No LLM was called. Use retrieved_top_k as RAG context for LLM in next step."
+        "llm_analysis": llm_analysis
     }
 
     return JSONResponse(resp)
