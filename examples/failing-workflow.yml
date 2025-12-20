@@ -1,0 +1,29 @@
+name: Intentional Failure + Auto Analysis
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  fail-and-send-logs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Run failing step
+        id: fail_step
+        run: |
+          echo "Simulating CI failure"
+          python -c "raise Exception('Database connection failed')"
+
+      - name: Send logs to AI Log Analyzer
+        if: failure()
+        run: |
+          curl -X POST http://<BACKEND_HOST>/webhook/ci \
+            -H "Content-Type: application/json" \
+            -d '{
+              "incident_id": "${{ github.run_id }}",
+              "log_text": "CI failed: Database connection failed"
+            }'

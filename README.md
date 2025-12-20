@@ -1,56 +1,77 @@
-AI Log Analyzer — Backend (Phase 1 Complete)
+# AI Log Analyzer 🔍🤖
 
-An intelligent backend service that accepts CI/CD logs, preprocesses them, embeds them, stores vectors in Qdrant, and retrieves relevant log chunks for LLM-based analysis.
+AI Log Analyzer is a backend DevOps tool that automatically analyzes CI/CD failure logs.
+Instead of manually reading long logs, the system preprocesses errors, retrieves relevant
+context using embeddings, and generates clear explanations and fixes using a remote LLM.
 
-✔ Completed Features (Phase 1)
+The system is backend-first, CI-agnostic, and designed to work even on low-spec machines.
 
-FastAPI backend
+---
 
-CI log preprocessing (traceback detection, error extraction)
+## 🚀 Key Features
 
-MinIO object storage integration
+- CI/CD webhook for automatic failure analysis
+- Log preprocessing to extract only error-relevant lines
+- Semantic retrieval using embeddings (RAG)
+- Remote LLM inference (Ollama) over private VPN (Tailscale)
+- Retry & timeout handling for network resilience
+- Safe design (no automatic code changes)
 
-SentenceTransformer embeddings
+---
 
-Qdrant vector indexing + fallback retrieval
+## 🧠 High-Level Architecture
 
-/analyze endpoint returning:
+CI Failure
+↓
+POST /webhook/ci
+↓
+Preprocessing (error extraction)
+↓
+Embeddings + Vector DB (Qdrant)
+↓
+Relevant chunk retrieval (RAG)
+↓
+Remote LLM (Ollama via Tailscale)
+↓
+Explanation + Fix Suggestions
 
-Preprocessed text
+yaml
+Copy code
 
-Metadata (error count, traceback flag)
+---
 
-Indexed vector chunks
+## 📦 Tech Stack
 
-Retrieved top-k similar chunks
+- **Backend**: FastAPI (Python)
+- **Vector DB**: Qdrant
+- **Object Storage**: MinIO
+- **Embeddings**: Sentence Transformers
+- **LLM**: Ollama (remote machine)
+- **Networking**: Tailscale (private VPN)
 
-✔ Technology Stack
+---
 
-Python 3.12
+## 🔧 Environment Setup
 
-FastAPI
+Create a `.env` file (DO NOT commit this):
 
-MinIO (S3-compatible storage)
+MINIO_ENDPOINT=localhost:9000
+MINIO_ACCESS_KEY=minio
+MINIO_SECRET_KEY=minio123
+MINIO_SECURE=false
 
-Qdrant (Vector DB)
+QDRANT_URL=http://localhost:6333
+EMBEDDING_MODEL=all-MiniLM-L6-v2
 
-SentenceTransformers (MiniLM)
+LLM_URL=http://<REMOTE_LLM_TAILSCALE_IP>:11434/api/generate
+LLM_MODEL=llama3
 
-Docker + docker-compose
+yaml
+Copy code
 
-✔ How to Run (Development)
-docker compose -f infra/docker-compose.yml up -d
+---
+
+## ▶️ Running the Backend
+
+```bash
 uvicorn backend.app.main:app --reload --port 8000
-
-✔ Test the API
-curl.exe --% -X POST http://localhost:8000/analyze `
- -H "Content-Type: application/json" `
- -d "{\"log_text\":\"Traceback...\"}"
-
-✔ Next Milestones
-
-Phase 2: LLM analysis module
-
-Phase 3: CI webhook integration (GitHub Actions/Jenkins)
-
-Phase 4: Frontend dashboard

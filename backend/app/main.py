@@ -22,6 +22,45 @@ try:
 except Exception as e:
     logging.warning("Could not ensure logs bucket: %s", e)
 
+async def analyze_log_text(raw_text: str, incident_id: str):
+    collection_name = f"{DEFAULT_COLLECTION_PREFIX}_{incident_id}"
+
+    reduced = extract_relevant_lines(raw_text)
+    metadata = summarize_metadata(raw_text)
+
+    index_result = index_chunks(reduced, collection=collection_name)
+    retrieved = retrieve_top_k(
+        "Summarize the failure and suggest fixes",
+        collection=collection_name,
+        k=5
+    )
+
+    llm_analysis = None
+    if retrieved:
+        context_blocks = [
+            f"[CHUNK {i+1}]\n{item['chunk']}"
+            for i, item in enumerate(retrieved)
+            if item.get("chunk")
+        ]
+
+        llm_prompt = f"""
+You are an expert CI/CD debugging assistant.
+
+LOG CONTEXT:
+{chr(10).join(context_blocks)}
+
+TASK:
+Explain the failure and suggest fixes.
+"""
+        llm_analysis = run_llm(llm_prompt)
+
+    return {
+        "incident_id": incident_id,
+        "metadata": metadata,
+        "retrieved_top_k": retrieved,
+        "llm_analysis": llm_analysis,
+    }
+
 
 @app.get("/")
 def root():
@@ -31,47 +70,35 @@ def root():
 @app.post("/webhook/ci")
 async def ci_webhook(request: Request):
     """
-    Receive CI webhook. If payload contains `log_text` or `log_url` (or artifact URL),
-    optionally store the raw log in MinIO and return an incident id and stored key.
-    For POC, this endpoint echoes back metadata and stores if log_text provided.
+    CI webhook endpoint.
+    Expects failure logs from CI system.
+    Automatically triggers analysis + LLM.
     """
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="invalid json payload")
 
-    incident_id = str(uuid.uuid4())
-    resp = {"incident_id": incident_id, "received": True, "payload_summary": {}}
+    # Minimal contract for now
+    raw_text = payload.get("log_text")
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="log_text missing")
 
-    # If log_text provided, store it
-    if "log_text" in payload and payload["log_text"]:
-        raw_bytes = payload["log_text"].encode("utf-8", errors="replace")
-        key = f"{incident_id}.log"
-        try:
-            store_log_bytes(raw_bytes, key, bucket=LOGS_BUCKET)
-            resp["stored_log_key"] = key
-        except Exception as e:
-            logging.exception("failed to store provided log_text")
-            resp["store_error"] = str(e)
+    incident_id = payload.get("incident_id") or str(uuid.uuid4())
 
-    # If there is a log_url, we don't download here in POC (you can later implement download)
-    if "log_url" in payload:
-        resp["note"] = "log_url received but not auto-downloaded in POC"
+    analysis = await analyze_log_text(raw_text, incident_id)
 
-    return JSONResponse(resp)
+    return JSONResponse({
+        "status": "analysis_completed",
+        "analysis": analysis
+    })
+
 
 
 from .llm import run_llm
 
 @app.post("/analyze")
 async def analyze(request: Request):
-    """
-    Analyze endpoint:
-    - preprocess logs
-    - embed + index into Qdrant
-    - retrieve top-k chunks
-    - call remote LLM for explanation + fixes
-    """
     try:
         payload = await request.json()
     except Exception:
@@ -80,114 +107,25 @@ async def analyze(request: Request):
     raw_text = None
     stored_key = None
     incident_id = payload.get("incident_id") or str(uuid.uuid4())
-    collection_name = f"{DEFAULT_COLLECTION_PREFIX}_{incident_id}"
 
-    # -----------------------------
-    # INPUT HANDLING
-    # -----------------------------
     if "log_text" in payload and payload["log_text"]:
         raw_text = payload["log_text"]
 
         if payload.get("store", False):
-            try:
-                key = f"{incident_id}.log"
-                store_log_bytes(
-                    raw_text.encode("utf-8", errors="replace"),
-                    key,
-                    bucket=LOGS_BUCKET
-                )
-                stored_key = key
-            except Exception:
-                logging.exception("failed to store log_text")
+            key = f"{incident_id}.log"
+            store_log_bytes(raw_text.encode(), key, bucket=LOGS_BUCKET)
+            stored_key = key
 
     elif "log_key" in payload and payload["log_key"]:
-        try:
-            raw_bytes = get_log_bytes(payload["log_key"], bucket=LOGS_BUCKET)
-            raw_text = raw_bytes.decode("utf-8", errors="replace")
-            stored_key = payload["log_key"]
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        raw_bytes = get_log_bytes(payload["log_key"], bucket=LOGS_BUCKET)
+        raw_text = raw_bytes.decode()
+        stored_key = payload["log_key"]
+
     else:
         raise HTTPException(status_code=400, detail="provide log_text or log_key")
 
-    # -----------------------------
-    # PREPROCESSING
-    # -----------------------------
-    reduced = extract_relevant_lines(raw_text)
-    metadata = summarize_metadata(raw_text)
+    # 🔥 Single call replaces ALL analysis logic
+    result = await analyze_log_text(raw_text, incident_id)
+    result["stored_key"] = stored_key
 
-    # -----------------------------
-    # EMBEDDINGS + INDEXING
-    # -----------------------------
-    try:
-        index_result = index_chunks(reduced, collection=collection_name)
-        indexed_count = index_result.get("count", 0)
-        index_error = None
-    except Exception as e:
-        logging.exception("indexing failed")
-        indexed_count = 0
-        index_error = str(e)
-
-    # -----------------------------
-    # RETRIEVAL (RAG)
-    # -----------------------------
-    try:
-        retrieved = retrieve_top_k(
-            "Summarize the failure and suggest fixes",
-            collection=collection_name,
-            k=5
-        )
-        retrieval_error = None
-    except Exception as e:
-        logging.exception("retrieval failed")
-        retrieved = []
-        retrieval_error = str(e)
-
-    # -----------------------------
-    # LLM ANALYSIS (REMOTE)
-    # -----------------------------
-    llm_analysis = None
-
-    if retrieved:
-        context_blocks = []
-        for idx, item in enumerate(retrieved, start=1):
-            if item.get("chunk"):
-                context_blocks.append(
-                    f"[CHUNK {idx}]\n{item['chunk']}"
-                )
-
-        llm_prompt = f"""
-You are an expert CI/CD debugging assistant.
-
-Below are extracted log snippets from a failed CI/CD pipeline.
-
-LOG CONTEXT:
-{chr(10).join(context_blocks)}
-
-TASK:
-1. Explain the root cause clearly.
-2. List 2–3 likely causes.
-3. Suggest concrete fixes (commands, config, or code).
-4. Mention assumptions if any.
-"""
-
-        llm_analysis = run_llm(llm_prompt)
-
-    # -----------------------------
-    # FINAL RESPONSE
-    # -----------------------------
-    resp = {
-        "incident_id": incident_id,
-        "stored_key": stored_key,
-        "collection": collection_name,
-        "reduced_preview": reduced[:2000],
-        "reduced_length": len(reduced),
-        "metadata": metadata,
-        "indexed_count": indexed_count,
-        "index_error": index_error,
-        "retrieved_top_k": retrieved,
-        "retrieval_error": retrieval_error,
-        "llm_analysis": llm_analysis
-    }
-
-    return JSONResponse(resp)
+    return JSONResponse(result)

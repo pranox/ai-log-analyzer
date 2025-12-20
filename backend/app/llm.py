@@ -8,6 +8,8 @@ with retries and timeouts for network resilience.
 import os
 import time
 import requests
+from dotenv import load_dotenv
+load_dotenv()
 
 # Load from environment (DO NOT hardcode)
 LLM_URL = os.getenv("LLM_URL")  # e.g. http://100.x.x.x:11434/api/generate
