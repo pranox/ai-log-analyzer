@@ -16,6 +16,8 @@ Functions:
 
 import re
 from typing import Dict, Any, List
+import json
+
 
 # Patterns that commonly indicate errors / failures in CI logs
 ERROR_KEYWORDS_RE = re.compile(
@@ -107,7 +109,7 @@ def extract_relevant_lines(text, max_lines: int = 500, context_lines: int = 2) -
     return combined
 
 
-def summarize_metadata(text: str) -> Dict[str, Any]:
+def summarize_metadata(text) -> Dict[str, Any]:
     """
     Return quick metadata about the log useful for prompts or UI:
     - total_lines
@@ -115,8 +117,18 @@ def summarize_metadata(text: str) -> Dict[str, Any]:
     - contains_traceback (bool)
     - detected_keywords (list)
     """
-    if not text:
-        return {"total_lines": 0, "error_line_count": 0, "contains_traceback": False, "detected_keywords": []}
+
+    # ✅ HARDEN INPUT (THIS IS THE FIX)
+    if text is None:
+        return {
+            "total_lines": 0,
+            "error_line_count": 0,
+            "contains_traceback": False,
+            "detected_keywords": []
+        }
+
+    if not isinstance(text, str):
+        text = json.dumps(text, indent=2)
 
     lines = text.splitlines()
     total = len(lines)
@@ -127,13 +139,10 @@ def summarize_metadata(text: str) -> Dict[str, Any]:
     for line in lines:
         if ERROR_KEYWORDS_RE.search(line):
             error_count += 1
-            # capture a normalized keyword for metadata tagging
             m = ERROR_KEYWORDS_RE.search(line)
             if m:
                 detected.add(m.group(0).upper())
 
-        # Robust detection: if the line contains the word "traceback" (case-insensitive),
-        # mark contains_traceback True. This is simpler and less brittle than relying solely on complex regex.
         if "traceback" in line.lower() or STACK_STARTERS_RE.search(line):
             contains_traceback = True
 
