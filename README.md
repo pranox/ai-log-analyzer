@@ -75,3 +75,8 @@ Copy code
 
 ```bash
 uvicorn backend.app.main:app --reload --port 8000
+## Deployment Mode: Tailscale-based LLM
+
+In this mode, the AI Log Analyzer connects to a remote LLM server
+over a private Tailscale network. This allows running LLMs on a
+separate machine without exposing public ports.
