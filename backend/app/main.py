@@ -12,6 +12,7 @@ from .llm import run_llm
 from .preprocess import extract_relevant_lines, summarize_metadata
 from .storage import store_log_bytes, get_log_bytes, ensure_bucket
 from .embeddings import index_chunks, retrieve_top_k
+from .incidents import save_incident, list_incidents, get_incident
 
 # ==================================================
 # ENV + APP SETUP
@@ -86,6 +87,13 @@ TASK:
 
     llm_analysis = run_llm(prompt)
     logger.info("LLM RESPONSE:\n%s", llm_analysis)
+
+     # ---- persist incident ----
+    save_incident(
+        incident_id=incident_id,
+        metadata=metadata,
+        llm_analysis=llm_analysis,
+    )
 
     return {
         "incident_id": incident_id,
@@ -204,3 +212,24 @@ async def analyze(request: Request):
     result["stored_key"] = stored_key
 
     return JSONResponse(result)
+
+@app.get("/incidents")
+def get_incidents():
+    """
+    List all analyzed incidents.
+    """
+    return {
+        "count": len(list_incidents()),
+        "incidents": list_incidents(),
+    }
+@app.get("/incidents/{incident_id}")
+def get_incident_by_id(incident_id: str):
+    """
+    Get full details for a single incident.
+    """
+    incident = get_incident(incident_id)
+
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    return incident
