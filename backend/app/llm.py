@@ -1,68 +1,33 @@
-"""
-llm.py
-
-Handles communication with a remote Ollama LLM server
-with retries and timeouts for network resilience.
-"""
-
 import os
-import time
-import requests
 from dotenv import load_dotenv
-load_dotenv()
+from groq import Groq
+from dotenv import load_dotenv
+import os
 
-# Load from environment (DO NOT hardcode)
-LLM_URL = os.getenv("LLM_URL")  # e.g. http://100.x.x.x:11434/api/generate
-LLM_MODEL = os.getenv("LLM_MODEL", "llama3")
+load_dotenv()  # ✅ MUST be at top
+from groq import Groq
 
-if not LLM_URL:
-    raise RuntimeError("LLM_URL is not set. Add it to your environment or .env file.")
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
-def run_llm(
-    prompt: str,
-    retries: int = 2,
-    timeout: int = 120,
-    backoff_seconds: int = 2,
-) -> str:
-    """
-    Send prompt to remote LLM with retry & timeout.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
 
-    retries: number of retry attempts (in addition to first try)
-    timeout: seconds to wait for LLM response per attempt
-    backoff_seconds: wait time between retries
-    """
-    payload = {
-        "model": LLM_MODEL,
-        "prompt": prompt,
-        "stream": False,
-    }
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY not set")
 
-    last_error = None
+client = Groq(api_key=GROQ_API_KEY)
 
-    for attempt in range(1, retries + 2):
-        try:
-            response = requests.post(
-                LLM_URL,
-                json=payload,
-                timeout=timeout,
-            )
-            response.raise_for_status()
-
-            # Ollama returns {"response": "..."}
-            return response.json().get("response", "").strip()
-
-        except requests.exceptions.RequestException as e:
-            last_error = e
-
-            # If we still have retries left, wait and retry
-            if attempt <= retries:
-                time.sleep(backoff_seconds)
-            else:
-                break
-
-    # Graceful failure (backend still returns JSON)
-    return (
-        "[LLM ERROR] Unable to get response from remote LLM "
-        f"after {retries + 1} attempts. Last error: {last_error}"
-    )
+def run_llm(prompt: str) -> str:
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("GROQ_MODEL"),
+            messages=[
+                {"role": "system", "content": "You are a CI/CD log analysis expert."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"[LLM ERROR] {str(e)}"

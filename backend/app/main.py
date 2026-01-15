@@ -2,9 +2,8 @@
 
 import os
 import uuid
-import logging
 import json
-import base64
+import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -14,68 +13,79 @@ from .preprocess import extract_relevant_lines, summarize_metadata
 from .storage import store_log_bytes, get_log_bytes, ensure_bucket
 from .embeddings import index_chunks, retrieve_top_k
 
-# --------------------------------------------------
+# ==================================================
 # ENV + APP SETUP
-# --------------------------------------------------
+# ==================================================
 
-load_dotenv()  # ✅ IMPORTANT: load .env
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ai-log-analyzer")
 
 app = FastAPI(title="AI Log Analyzer Backend")
 
 LOGS_BUCKET = os.getenv("LOGS_BUCKET", "logs")
 DEFAULT_COLLECTION_PREFIX = os.getenv("COLLECTION_PREFIX", "logs")
 
-# --------------------------------------------------
-# OPTIONAL STORAGE INIT (non-blocking)
-# --------------------------------------------------
+# ==================================================
+# STORAGE INIT (NON-BLOCKING)
+# ==================================================
 
 try:
     ensure_bucket(LOGS_BUCKET)
 except Exception as e:
     logger.warning("Could not ensure logs bucket: %s", e)
 
-# --------------------------------------------------
-# CORE ANALYSIS PIPELINE (shared logic)
-# --------------------------------------------------
+# ==================================================
+# CORE ANALYSIS PIPELINE
+# ==================================================
 
 async def analyze_log_text(raw_text: str, incident_id: str) -> dict:
-    collection_name = f"{DEFAULT_COLLECTION_PREFIX}_{incident_id}"
+    """
+    Shared analysis logic used by both CI webhook and manual API.
+    """
+
+    # SAFETY: ensure string
+    if not isinstance(raw_text, str):
+        raw_text = json.dumps(raw_text, indent=2)
 
     logger.info("Analyzing incident_id=%s", incident_id)
 
+    collection_name = f"{DEFAULT_COLLECTION_PREFIX}_{incident_id}"
+
+    # ---- preprocessing ----
     reduced = extract_relevant_lines(raw_text)
     metadata = summarize_metadata(raw_text)
 
+    # ---- embeddings / indexing ----
     index_chunks(reduced, collection=collection_name)
 
     retrieved = retrieve_top_k(
         "Summarize the failure and suggest fixes",
         collection=collection_name,
-        k=5
+        k=5,
     )
 
-    llm_analysis = None
-    if retrieved:
-        context_blocks = [
-            f"[CHUNK {i + 1}]\n{item['chunk']}"
-            for i, item in enumerate(retrieved)
-            if item.get("chunk")
-        ]
+    # ---- LLM ----
+    context_blocks = []
+    for i, item in enumerate(retrieved):
+        if item.get("chunk"):
+            context_blocks.append(f"[CHUNK {i + 1}]\n{item['chunk']}")
 
-        prompt = f"""
+    prompt = f"""
 You are an expert CI/CD debugging assistant.
 
 LOG CONTEXT:
-{chr(10).join(context_blocks)}
+{chr(10).join(context_blocks) if context_blocks else reduced}
 
 TASK:
-Explain the failure and suggest fixes.
+1. Explain the root cause.
+2. Suggest concrete fixes.
+3. Mention assumptions if needed.
 """
 
-        llm_analysis = run_llm(prompt)
+    llm_analysis = run_llm(prompt)
+    logger.info("LLM RESPONSE:\n%s", llm_analysis)
 
     return {
         "incident_id": incident_id,
@@ -84,71 +94,84 @@ Explain the failure and suggest fixes.
         "llm_analysis": llm_analysis,
     }
 
-# --------------------------------------------------
+# ==================================================
 # HEALTH CHECK
-# --------------------------------------------------
+# ==================================================
 
 @app.get("/")
 def root():
-    return {"message": "AI Log Analyzer Backend Running"}
+    return {"status": "ok", "service": "AI Log Analyzer"}
 
-# --------------------------------------------------
-# CI WEBHOOK (AUTOMATED ENTRY POINT)
-# --------------------------------------------------
-
-import json
-import uuid
-from fastapi import Request
-from fastapi.responses import JSONResponse
+# ==================================================
+# CI WEBHOOK ENDPOINT
+# ==================================================
 
 @app.post("/webhook/ci")
 async def ci_webhook(request: Request):
+    """
+    Entry point for CI systems.
+    Must NEVER fail the pipeline.
+    """
+
     logger.info(">>> CI WEBHOOK HIT <<<")
 
     body = await request.body()
 
-    # 1️⃣ Guard: empty body
+    # ---- guard: empty body ----
     if not body:
-        logger.error("Empty request body received from CI")
+        logger.warning("Empty request body received from CI")
         return JSONResponse(
             status_code=200,
-            content={"status": "ignored", "reason": "empty body"}
+            content={"status": "ignored", "reason": "empty body"},
         )
 
-    # 2️⃣ Guard: invalid JSON
+    # ---- guard: invalid JSON ----
     try:
         payload = json.loads(body)
     except Exception:
-        logger.error("Invalid JSON from CI: %s", body)
+        logger.warning("Invalid JSON received from CI")
         return JSONResponse(
             status_code=200,
-            content={"status": "ignored", "reason": "invalid json"}
+            content={"status": "ignored", "reason": "invalid json"},
         )
 
-    # 3️⃣ Guard: missing log
     log_text = payload.get("log_text")
     if not log_text:
         return JSONResponse(
             status_code=200,
-            content={"status": "ignored", "reason": "empty log"}
+            content={"status": "ignored", "reason": "no log_text"},
         )
 
     incident_id = payload.get("incident_id") or str(uuid.uuid4())
 
-    analysis = await analyze_log_text(log_text, incident_id)
+    try:
+        analysis = await analyze_log_text(log_text, incident_id)
+    except Exception as e:
+        logger.exception("Analysis failed")
+        return JSONResponse(
+            status_code=200,
+            content={"status": "analysis_failed", "error": str(e)},
+        )
 
-    return {
-        "status": "analysis_completed",
-        "incident_id": incident_id,
-        "analysis": analysis
-    }
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "analysis_completed",
+            "incident_id": incident_id,
+            "analysis": analysis,
+        },
+    )
 
-# --------------------------------------------------
+# ==================================================
 # MANUAL ANALYZE ENDPOINT (DEBUG / UI)
-# --------------------------------------------------
+# ==================================================
 
 @app.post("/analyze")
 async def analyze(request: Request):
+    """
+    Manual API for testing or UI usage.
+    """
+
     try:
         payload = await request.json()
     except Exception:
@@ -172,11 +195,10 @@ async def analyze(request: Request):
         stored_key = payload["log_key"]
 
     else:
-        raise HTTPException(status_code=400, detail="provide log_text or log_key")
-
-    # ✅ SAFETY (important)
-    if raw_text is not None and not isinstance(raw_text, str):
-        raw_text = json.dumps(raw_text, indent=2)
+        raise HTTPException(
+            status_code=400,
+            detail="provide log_text or log_key",
+        )
 
     result = await analyze_log_text(raw_text, incident_id)
     result["stored_key"] = stored_key
