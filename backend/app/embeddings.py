@@ -14,6 +14,7 @@ from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
 import requests
+
 # --------------------------
 # Configuration
 # --------------------------
@@ -53,7 +54,14 @@ def chunk_text(text: str, chunk_size: int = 2000, overlap: int = 200) -> List[st
 # --------------------------
 # Indexing Function
 # --------------------------
-def index_chunks(text: str, collection: str = "logs") -> Dict[str, Any]:
+
+from typing import Dict, Any, Optional
+
+def index_chunks(
+    text: str,
+    collection: str = "logs",
+    payload: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     Embeds text chunks and stores them in Qdrant.
     """
@@ -64,7 +72,7 @@ def index_chunks(text: str, collection: str = "logs") -> Dict[str, Any]:
     vectors = embedder.encode(chunks, show_progress_bar=False)
     dim = len(vectors[0])
 
-    # Create vector collection
+    # Create / reset vector collection
     qdrant.recreate_collection(
         collection_name=collection,
         vectors_config=rest.VectorParams(
@@ -73,20 +81,27 @@ def index_chunks(text: str, collection: str = "logs") -> Dict[str, Any]:
         )
     )
 
-    # Upload chunks
-    payloads = []
+    points = []
     for idx, (chunk, vec) in enumerate(zip(chunks, vectors)):
-        payloads.append(
+        point_payload = {
+            "chunk": chunk,
+            **(payload or {})
+        }
+
+        points.append(
             rest.PointStruct(
                 id=idx,
                 vector=vec.tolist(),
-                payload={"chunk": chunk}
+                payload=point_payload
             )
         )
 
-    qdrant.upsert(collection_name=collection, points=payloads)
+    qdrant.upsert(collection_name=collection, points=points)
 
-    return {"count": len(chunks), "collection": collection}
+    return {
+        "count": len(chunks),
+        "collection": collection
+    }
 
 
 # --------------------------

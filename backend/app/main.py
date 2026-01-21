@@ -7,12 +7,30 @@ import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
-
+from .github import post_pr_comment
 from .llm import run_llm
 from .preprocess import extract_relevant_lines, summarize_metadata
 from .storage import store_log_bytes, get_log_bytes, ensure_bucket
 from .embeddings import index_chunks, retrieve_top_k
 from .incidents import save_incident, list_incidents, get_incident
+from .failure_detector import extract_failure_block
+from .language_detector import detect_language
+from .fingerprint import extract_failure_signature
+from .lineage import update_lineage
+from .lineage import list_lineages, get_lineage
+from .confidence import calculate_confidence
+from .regression import detect_regression
+from .incidents import save_incident
+from .confidence import calculate_confidence
+from .lineage import update_lineage
+from .language_detector import detect_language
+from .failure_detector import (
+    extract_failure_block,
+    extract_failure_signature,
+)
+from .incident_index import index_incident_summary
+from .clusters import assign_cluster
+from .clusters import list_clusters
 
 # ==================================================
 # ENV + APP SETUP
@@ -41,24 +59,107 @@ except Exception as e:
 # CORE ANALYSIS PIPELINE
 # ==================================================
 
-async def analyze_log_text(raw_text: str, incident_id: str) -> dict:
-    """
-    Shared analysis logic used by both CI webhook and manual API.
-    """
 
-    # SAFETY: ensure string
+
+async def analyze_log_text(
+    raw_text: str,
+    incident_id: str,
+    repo: str | None = None,
+    pr_number: int | None = None,
+) -> dict:
+    regression = None
+    # --------------------------------------------------
+    # SAFETY
+    # --------------------------------------------------
     if not isinstance(raw_text, str):
         raw_text = json.dumps(raw_text, indent=2)
 
     logger.info("Analyzing incident_id=%s", incident_id)
 
-    collection_name = f"{DEFAULT_COLLECTION_PREFIX}_{incident_id}"
-
-    # ---- preprocessing ----
-    reduced = extract_relevant_lines(raw_text)
+    # --------------------------------------------------
+    # STEP 1: FAILURE SIGNAL DETECTION (HARD GATE)
+    # --------------------------------------------------
+    failure_block = extract_failure_block(raw_text)
     metadata = summarize_metadata(raw_text)
+    language = detect_language(raw_text)
+    # ---- ensure mandatory metadata keys ----
+    metadata.setdefault("fingerprint", "UNKNOWN")
+    metadata.setdefault("exception", "UNKNOWN")
+    metadata.setdefault("failing_line", "UNKNOWN")
 
-    # ---- embeddings / indexing ----
+    metadata["language"] = language
+
+    failure_sig = extract_failure_signature(raw_text, language)
+    metadata["fingerprint"] = failure_sig.get("fingerprint", "UNKNOWN")
+    metadata["exception"] = failure_sig.get("exception", "UNKNOWN")
+    metadata["failing_line"] = failure_sig.get("failing_line", "UNKNOWN")
+
+    cluster_id = assign_cluster(
+    incident_id=incident_id,
+    fingerprint = metadata.get("fingerprint", "UNKNOWN"),
+    language=language,
+    exception=metadata["exception"],
+)
+
+    metadata["cluster_id"] = cluster_id
+
+    metadata.update({
+        "fingerprint": failure_sig.get("fingerprint"),
+        "exception": failure_sig.get("exception"),
+        "failing_line": failure_sig.get("failing_line"),
+    })
+
+    logger.info(
+        "Fingerprint=%s Exception=%s",
+        metadata["fingerprint"],
+        metadata["exception"],
+    )
+
+    # --------------------------------------------------
+    # NO FAILURE FOUND → EXIT EARLY (IMPORTANT)
+    # --------------------------------------------------
+    if not failure_block:
+        logger.warning("No failure signal detected for incident %s", incident_id)
+
+        llm_analysis = "NO FAILURE SIGNAL FOUND IN LOGS."
+
+        confidence = calculate_confidence(
+            raw_log=raw_text,
+            llm_output=llm_analysis,
+        )
+
+        save_incident(
+            incident_id=incident_id,
+            metadata=metadata,
+            llm_analysis=llm_analysis,
+            confidence=confidence,
+            regression_of=regression["matched_incident"] if regression else None,
+        )
+
+        update_lineage(
+            fingerprint=metadata["fingerprint"],
+            incident_id=incident_id,
+            repo=repo,
+            language=language,
+        )
+
+        return {
+            "incident_id": incident_id,
+            "metadata": metadata,
+            "llm_analysis": llm_analysis,
+            "confidence": confidence,
+            "regression": None,
+        }
+
+    # --------------------------------------------------
+    # STEP 2: PREPROCESS FAILURE CONTENT ONLY
+    # --------------------------------------------------
+    reduced = extract_relevant_lines(failure_block)
+
+    # --------------------------------------------------
+    # STEP 3: VECTOR INDEXING
+    # --------------------------------------------------
+    collection_name = f"{DEFAULT_COLLECTION_PREFIX}_{incident_id}"
     index_chunks(reduced, collection=collection_name)
 
     retrieved = retrieve_top_k(
@@ -67,40 +168,120 @@ async def analyze_log_text(raw_text: str, incident_id: str) -> dict:
         k=5,
     )
 
-    # ---- LLM ----
-    context_blocks = []
-    for i, item in enumerate(retrieved):
-        if item.get("chunk"):
-            context_blocks.append(f"[CHUNK {i + 1}]\n{item['chunk']}")
+    # --------------------------------------------------
+    # STEP 4: CONTEXT BUILDING
+    # --------------------------------------------------
+    context_blocks = [
+        f"[CHUNK {i + 1}]\n{item['chunk']}"
+        for i, item in enumerate(retrieved)
+        if item.get("chunk")
+    ]
 
+    context = "\n\n".join(context_blocks)
+
+    # --------------------------------------------------
+    # STEP 5: ANTI-HALLUCINATION PROMPT
+    # --------------------------------------------------
     prompt = f"""
-You are an expert CI/CD debugging assistant.
+You are a CI failure analyzer.
 
-LOG CONTEXT:
-{chr(10).join(context_blocks) if context_blocks else reduced}
+LANGUAGE: {language.upper()}
+
+STRICT RULES:
+- Analyze ONLY errors related to {language}.
+- Quote the EXACT exception name from the log.
+- Quote the EXACT failing line or operation.
+- If no exception exists, say EXACTLY: "NO EXPLICIT ERROR FOUND".
+- Do NOT guess.
+- Do NOT invent causes.
+
+LOG:
+{context}
 
 TASK:
-1. Explain the root cause.
-2. Suggest concrete fixes.
-3. Mention assumptions if needed.
+Explain the failure and suggest fixes.
 """
-
-    llm_analysis = run_llm(prompt)
+  
+    if failure_sig["exception"] == "UNKNOWN":
+      llm_analysis = "NO EXPLICIT ERROR FOUND"
+    else:
+     llm_analysis = run_llm(prompt)
     logger.info("LLM RESPONSE:\n%s", llm_analysis)
 
-     # ---- persist incident ----
+    # --------------------------------------------------
+    # STEP 6: CONFIDENCE + REGRESSION
+    # --------------------------------------------------
+    confidence = calculate_confidence(
+        raw_log=raw_text,
+        llm_output=llm_analysis,
+    )
+
+    regression = detect_regression(
+        incident_id=incident_id,
+        summary=llm_analysis,
+    )
+
+    # --------------------------------------------------
+    # STEP 7: PERSIST INCIDENT
+    # --------------------------------------------------
     save_incident(
         incident_id=incident_id,
         metadata=metadata,
         llm_analysis=llm_analysis,
+        confidence=confidence,
+        regression_of=regression["matched_incident"] if regression else None,
+    )
+    index_incident_summary(incident_id, llm_analysis)
+    update_lineage(
+        fingerprint=metadata["fingerprint"],
+        incident_id=incident_id,
+        repo=repo,
+        language=language,
     )
 
+    # --------------------------------------------------
+    # STEP 8: PR COMMENT BOT (OPTIONAL)
+    # --------------------------------------------------
+    if repo and pr_number:
+        regression_block = ""
+
+        if regression:
+            regression_block = f"""
+### 🔁 Regression Detected
+This failure matches incident `{regression['matched_incident']}`
+(Similarity: {regression['similarity']:.2f})
+"""
+
+        comment = f"""
+🚨 **CI Failure Analysis**
+
+**Incident ID:** `{incident_id}`
+
+### 🧠 Root Cause
+{llm_analysis}
+
+### 📊 Confidence
+{confidence['level']} ({confidence['score']}%)
+
+{regression_block}
+
+---
+_AI-generated. Please review before applying._
+"""
+        post_pr_comment(repo, pr_number, comment)
+
+    # --------------------------------------------------
+    # FINAL RESPONSE
+    # --------------------------------------------------
     return {
         "incident_id": incident_id,
         "metadata": metadata,
-        "retrieved_top_k": retrieved,
         "llm_analysis": llm_analysis,
+        "confidence": confidence,
+        "regression": regression,
     }
+
+
 
 # ==================================================
 # HEALTH CHECK
@@ -233,3 +414,24 @@ def get_incident_by_id(incident_id: str):
         raise HTTPException(status_code=404, detail="Incident not found")
 
     return incident
+@app.get("/lineage")
+def list_error_lineages():
+    return {
+        "count": len(list_lineages()),
+        "lineages": list_lineages(),
+    }
+@app.get("/lineage/{fingerprint}")
+def get_error_lineage(fingerprint: str):
+    lineage = get_lineage(fingerprint)
+    if not lineage:
+        raise HTTPException(status_code=404, detail="Fingerprint not found")
+    return lineage
+
+from .clusters import list_clusters
+
+@app.get("/clusters")
+def get_clusters():
+    return {
+        "count": len(list_clusters()),
+        "clusters": list_clusters(),
+    }
